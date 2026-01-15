@@ -1,11 +1,124 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from telegram import Update, Bot, WebAppInfo, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes
 import httpx
 import os
+import json
+import sqlite3
+import uuid
+import asyncio
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+# === Config ===
+ELEVEN_LABS_API_KEY = os.getenv("ELEVEN_LABS_API_KEY")
+VOICE_ID = os.getenv("VOICE_ID")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+APP_URL = os.getenv("APP_URL", "https://rocky-production-4c4f.up.railway.app")
+
+# === Database ===
+def init_db():
+    conn = sqlite3.connect('parties.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS parties
+                 (id TEXT PRIMARY KEY,
+                  birthday_kid TEXT,
+                  created_by_tg_id INTEGER,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS guests
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  party_id TEXT,
+                  name TEXT,
+                  claimed_by_tg_id INTEGER,
+                  claimed_at TIMESTAMP,
+                  FOREIGN KEY (party_id) REFERENCES parties(id))''')
+    conn.commit()
+    conn.close()
+
+def create_party(party_id: str, birthday_kid: str, guests: list, tg_id: int):
+    conn = sqlite3.connect('parties.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO parties (id, birthday_kid, created_by_tg_id) VALUES (?, ?, ?)",
+              (party_id, birthday_kid, tg_id))
+    for guest in guests:
+        c.execute("INSERT INTO guests (party_id, name) VALUES (?, ?)", (party_id, guest))
+    conn.commit()
+    conn.close()
+
+def get_party(party_id: str):
+    conn = sqlite3.connect('parties.db')
+    c = conn.cursor()
+    c.execute("SELECT birthday_kid FROM parties WHERE id = ?", (party_id,))
+    party = c.fetchone()
+    if not party:
+        conn.close()
+        return None
+    c.execute("SELECT name, claimed_by_tg_id FROM guests WHERE party_id = ?", (party_id,))
+    guests = [{"name": row[0], "claimed": row[1] is not None} for row in c.fetchall()]
+    conn.close()
+    return {"birthday_kid": party[0], "guests": guests}
+
+def claim_guest(party_id: str, guest_name: str, tg_id: int):
+    conn = sqlite3.connect('parties.db')
+    c = conn.cursor()
+    c.execute("""UPDATE guests SET claimed_by_tg_id = ?, claimed_at = CURRENT_TIMESTAMP 
+                 WHERE party_id = ? AND name = ? AND claimed_by_tg_id IS NULL""",
+              (tg_id, party_id, guest_name))
+    conn.commit()
+    conn.close()
+
+# === Telegram Bot ===
+bot_app = None
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    
+    if args and len(args) > 0:
+        # Гость переходит по ссылке на вечеринку
+        party_id = args[0]
+        party = get_party(party_id)
+        if party:
+            webapp_url = f"{APP_URL}?party={party_id}"
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎉 Открыть приглашение", web_app=WebAppInfo(url=webapp_url))]
+            ])
+            await update.message.reply_text(
+                f"🦊 Привет! {party['birthday_kid']} приглашает тебя на День Рождения!\n\n"
+                "Нажми кнопку, чтобы получить персональное приглашение от Лиса Рокки!",
+                reply_markup=keyboard
+            )
+        else:
+            await update.message.reply_text("Упс, приглашение не найдено 😕")
+    else:
+        # Мама создаёт новую вечеринку
+        webapp_url = f"{APP_URL}?mode=create&tg_id={update.effective_user.id}"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎈 Создать приглашения", web_app=WebAppInfo(url=webapp_url))]
+        ])
+        await update.message.reply_text(
+            "🦊 Привет! Я Лис Рокки из Hello Park!\n\n"
+            "Я помогу создать персональные приглашения для гостей на День Рождения.\n\n"
+            "Нажми кнопку, чтобы начать!",
+            reply_markup=keyboard
+        )
+
+async def setup_bot():
+    global bot_app
+    if BOT_TOKEN:
+        bot_app = Application.builder().token(BOT_TOKEN).build()
+        bot_app.add_handler(CommandHandler("start", start_command))
+        await bot_app.initialize()
+
+# === FastAPI ===
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    await setup_bot()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,13 +127,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ELEVEN_LABS_API_KEY = os.getenv("ELEVEN_LABS_API_KEY", "sk_e86d5c0fb7b75e625006b86dc78cf05cca0e52b1a905bb0d")
-VOICE_ID = os.getenv("VOICE_ID", "9v8bxagMX43JiaF92sqe")
-
+# === API Models ===
 class GenerateRequest(BaseModel):
     guest_name: str
     birthday_kid: str
 
+class CreatePartyRequest(BaseModel):
+    birthday_kid: str
+    guests: list[str]
+    tg_id: int
+
+class ClaimGuestRequest(BaseModel):
+    party_id: str
+    guest_name: str
+    tg_id: int
+
+# === API Endpoints ===
 @app.post("/api/generate-audio")
 async def generate_audio(req: GenerateRequest):
     text = f"Привет, {req.guest_name}! Я Лис Рокки из Hello Park. {req.birthday_kid} приглашает тебя на свой день рождения, чтобы спасти космическую вечеринку! Я жду тебя, и у меня есть для тебя секретное задание!"
@@ -28,25 +150,40 @@ async def generate_audio(req: GenerateRequest):
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}",
-            headers={
-                "Content-Type": "application/json",
-                "xi-api-key": ELEVEN_LABS_API_KEY
-            },
-            json={
-                "text": text,
-                "model_id": "eleven_multilingual_v2",
-                "voice_settings": {
-                    "stability": 0.5,
-                    "similarity_boost": 0.75
-                }
-            },
+            headers={"Content-Type": "application/json", "xi-api-key": ELEVEN_LABS_API_KEY},
+            json={"text": text, "model_id": "eleven_multilingual_v2",
+                  "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}},
             timeout=30.0
         )
-        
         if response.status_code != 200:
             raise HTTPException(status_code=500, detail="ElevenLabs API error")
-        
         return Response(content=response.content, media_type="audio/mpeg")
+
+@app.post("/api/party")
+async def create_party_endpoint(req: CreatePartyRequest):
+    party_id = str(uuid.uuid4())[:8]
+    create_party(party_id, req.birthday_kid, req.guests, req.tg_id)
+    return {"party_id": party_id, "share_link": f"https://t.me/RockyHelloParkBot?start={party_id}"}
+
+@app.get("/api/party/{party_id}")
+async def get_party_endpoint(party_id: str):
+    party = get_party(party_id)
+    if not party:
+        raise HTTPException(status_code=404, detail="Party not found")
+    return party
+
+@app.post("/api/claim")
+async def claim_guest_endpoint(req: ClaimGuestRequest):
+    claim_guest(req.party_id, req.guest_name, req.tg_id)
+    return {"status": "ok"}
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    if bot_app:
+        data = await request.json()
+        update = Update.de_json(data, bot_app.bot)
+        await bot_app.process_update(update)
+    return {"status": "ok"}
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -57,8 +194,9 @@ HTML_CONTENT = '''
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Приглашение от Рокки</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -67,10 +205,7 @@ HTML_CONTENT = '''
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
             padding: 20px;
         }
-        .container {
-            max-width: 400px;
-            margin: 0 auto;
-        }
+        .container { max-width: 400px; margin: 0 auto; }
         .card {
             background: rgba(255,255,255,0.1);
             border-radius: 20px;
@@ -86,93 +221,50 @@ HTML_CONTENT = '''
         p { color: rgba(255,255,255,0.7); font-size: 14px; margin-top: 8px; line-height: 1.5; }
         label { color: rgba(255,255,255,0.9); font-size: 14px; display: block; margin-bottom: 8px; }
         input {
-            width: 100%;
-            padding: 12px 16px;
-            border-radius: 12px;
-            border: none;
-            font-size: 16px;
-            background: rgba(255,255,255,0.9);
+            width: 100%; padding: 12px 16px; border-radius: 12px;
+            border: none; font-size: 16px; background: rgba(255,255,255,0.9);
         }
         .input-row { display: flex; gap: 8px; }
         .input-row input { flex: 1; }
         .btn {
-            padding: 16px;
-            border-radius: 12px;
-            border: none;
-            font-size: 16px;
-            cursor: pointer;
-            width: 100%;
-            font-weight: 600;
+            padding: 16px; border-radius: 12px; border: none;
+            font-size: 16px; cursor: pointer; width: 100%; font-weight: 600;
         }
-        .btn-primary {
-            background: linear-gradient(135deg, #ff6b35 0%, #f7931e 100%);
-            color: #fff;
-        }
-        .btn-add {
-            padding: 12px 20px;
-            width: auto;
-            background: #ff6b35;
-            color: #fff;
-        }
-        .btn-secondary {
-            background: rgba(255,107,53,0.1);
-            border: 2px solid rgba(255,107,53,0.5);
-            color: #fff;
-        }
+        .btn-primary { background: linear-gradient(135deg, #ff6b35 0%, #f7931e 100%); color: #fff; }
+        .btn-add { padding: 12px 20px; width: auto; background: #ff6b35; color: #fff; }
+        .btn-secondary { background: rgba(255,107,53,0.1); border: 2px solid rgba(255,107,53,0.5); color: #fff; }
         .btn-play {
-            padding: 16px 32px;
-            border-radius: 50px;
-            width: auto;
-            margin: 20px auto 0;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 18px;
+            padding: 16px 32px; border-radius: 50px; width: auto;
+            margin: 20px auto 0; display: flex; align-items: center; gap: 8px; font-size: 18px;
         }
-        .btn-back {
-            background: transparent;
-            color: rgba(255,255,255,0.5);
-            font-size: 14px;
-            padding: 12px;
-        }
-        .btn:disabled {
-            background: rgba(255,255,255,0.2);
-            cursor: not-allowed;
-        }
+        .btn-back { background: transparent; color: rgba(255,255,255,0.5); font-size: 14px; padding: 12px; }
+        .btn:disabled { background: rgba(255,255,255,0.2); cursor: not-allowed; }
         .guests { margin: 20px 0; }
         .guests-label { color: rgba(255,255,255,0.7); font-size: 13px; margin-bottom: 8px; }
         .guest-tags { display: flex; flex-wrap: wrap; gap: 8px; }
         .guest-tag {
-            background: rgba(255,107,53,0.3);
-            color: #fff;
-            padding: 8px 12px;
-            border-radius: 20px;
-            font-size: 14px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
+            background: rgba(255,107,53,0.3); color: #fff; padding: 8px 12px;
+            border-radius: 20px; font-size: 14px; display: flex; align-items: center; gap: 8px;
         }
         .guest-tag span { cursor: pointer; opacity: 0.7; }
-        .guest-btn {
-            padding: 16px 20px;
-            margin-bottom: 12px;
-            font-size: 18px;
-        }
+        .guest-btn { padding: 16px 20px; margin-bottom: 12px; font-size: 18px; }
         .field { margin-bottom: 20px; }
         .task-placeholder {
             background: linear-gradient(135deg, #2a2a4a 0%, #1a1a3a 100%);
-            border-radius: 12px;
-            padding: 40px 20px;
-            text-align: center;
-            margin-bottom: 16px;
+            border-radius: 12px; padding: 40px 20px; text-align: center; margin-bottom: 16px;
         }
         .loading { opacity: 0.7; pointer-events: none; }
         .hidden { display: none; }
+        .share-link {
+            background: rgba(255,255,255,0.1); border-radius: 12px; padding: 16px;
+            word-break: break-all; color: #fff; font-size: 14px; margin: 16px 0;
+        }
+        .btn-copy { background: #4CAF50; margin-top: 8px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <!-- Экран 1: Настройка -->
+        <!-- Экран 1: Создание вечеринки -->
         <div id="screen-setup">
             <div class="card">
                 <div class="header">
@@ -180,12 +272,10 @@ HTML_CONTENT = '''
                     <h1>Приглашения от Рокки</h1>
                     <p>Создайте персональные приглашения для гостей</p>
                 </div>
-                
                 <div class="field">
                     <label>Имя именинника</label>
                     <input type="text" id="birthday-kid" placeholder="Например: Миша">
                 </div>
-                
                 <div class="field">
                     <label>Добавить гостей</label>
                     <div class="input-row">
@@ -193,18 +283,32 @@ HTML_CONTENT = '''
                         <button class="btn btn-add" onclick="addGuest()">+</button>
                     </div>
                 </div>
-                
                 <div class="guests hidden" id="guests-container">
                     <div class="guests-label">Гости (<span id="guests-count">0</span>):</div>
                     <div class="guest-tags" id="guests-list"></div>
                 </div>
-                
-                <button class="btn btn-primary" id="create-btn" onclick="createInvites()" disabled>
+                <button class="btn btn-primary" id="create-btn" onclick="createParty()" disabled>
                     Создать приглашения 🎉
                 </button>
             </div>
         </div>
-        
+
+        <!-- Экран 1.5: Ссылка для шаринга -->
+        <div id="screen-share" class="hidden">
+            <div class="card">
+                <div class="header">
+                    <div class="emoji">✅</div>
+                    <h1>Приглашения готовы!</h1>
+                    <p>Отправьте эту ссылку родителям гостей</p>
+                </div>
+                <div class="share-link" id="share-link"></div>
+                <button class="btn btn-copy" onclick="copyLink()">📋 Скопировать ссылку</button>
+                <button class="btn btn-secondary" style="margin-top: 12px" onclick="testInvite()">
+                    👀 Посмотреть как выглядит
+                </button>
+            </div>
+        </div>
+
         <!-- Экран 2: Выбор имени -->
         <div id="screen-select" class="hidden">
             <div class="card">
@@ -214,10 +318,9 @@ HTML_CONTENT = '''
                     <p>Выбери своё имя, чтобы получить персональное приглашение от Лиса Рокки</p>
                 </div>
                 <div id="guest-buttons"></div>
-                <button class="btn btn-back" onclick="showScreen('setup')">← Назад к настройке</button>
             </div>
         </div>
-        
+
         <!-- Экран 3: Приглашение -->
         <div id="screen-invite" class="hidden">
             <div class="card" style="text-align: center;">
@@ -227,11 +330,9 @@ HTML_CONTENT = '''
                 <audio id="audio-player"></audio>
                 <button class="btn btn-primary btn-play" onclick="playAudio()">▶️ Послушать</button>
             </div>
-            
             <button class="btn btn-secondary" id="task-btn" onclick="showTask()">
                 🎯 Посмотреть секретное задание
             </button>
-            
             <div class="card hidden" id="task-card">
                 <h2>🎯 Секретное задание от Рокки</h2>
                 <div class="task-placeholder">
@@ -242,20 +343,56 @@ HTML_CONTENT = '''
                     Выполни задание и покажи Рокки в парке, чтобы получить специальный приз! 🎁
                 </p>
             </div>
-            
-            <button class="btn btn-back" onclick="backToSelect()">← Выбрать другое имя</button>
         </div>
     </div>
 
     <script>
+        const tg = window.Telegram?.WebApp;
+        if (tg) tg.expand();
+        
+        const urlParams = new URLSearchParams(window.location.search);
+        const partyId = urlParams.get('party');
+        const mode = urlParams.get('mode');
+        const tgId = urlParams.get('tg_id') || tg?.initDataUnsafe?.user?.id || 0;
+        
         let guests = [];
         let birthdayKid = '';
-        let selectedGuest = '';
-        
-        document.getElementById('new-guest').addEventListener('keypress', (e) => {
+        let currentPartyId = partyId;
+        let shareLink = '';
+
+        // Если есть party_id — показываем экран выбора имени
+        if (partyId) {
+            loadParty(partyId);
+        }
+
+        async function loadParty(id) {
+            try {
+                const response = await fetch(`/api/party/${id}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    birthdayKid = data.birthday_kid;
+                    guests = data.guests.map(g => g.name);
+                    document.getElementById('select-title').textContent = 
+                        `${birthdayKid} приглашает тебя на День Рождения!`;
+                    renderGuestButtons();
+                    showScreen('select');
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        function renderGuestButtons() {
+            const btns = document.getElementById('guest-buttons');
+            btns.innerHTML = guests.map(g => 
+                `<button class="btn btn-secondary guest-btn" onclick="selectGuest('${g}')">${g}</button>`
+            ).join('');
+        }
+
+        document.getElementById('new-guest')?.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') addGuest();
         });
-        
+
         function addGuest() {
             const input = document.getElementById('new-guest');
             const name = input.value.trim();
@@ -265,19 +402,19 @@ HTML_CONTENT = '''
                 renderGuests();
             }
         }
-        
+
         function removeGuest(name) {
             guests = guests.filter(g => g !== name);
             renderGuests();
         }
-        
+
         function renderGuests() {
             const container = document.getElementById('guests-container');
             const list = document.getElementById('guests-list');
             const count = document.getElementById('guests-count');
             const btn = document.getElementById('create-btn');
             const kid = document.getElementById('birthday-kid').value.trim();
-            
+
             if (guests.length > 0) {
                 container.classList.remove('hidden');
                 count.textContent = guests.length;
@@ -287,27 +424,50 @@ HTML_CONTENT = '''
             } else {
                 container.classList.add('hidden');
             }
-            
             btn.disabled = !(guests.length > 0 && kid);
         }
-        
-        document.getElementById('birthday-kid').addEventListener('input', renderGuests);
-        
-        function createInvites() {
+
+        document.getElementById('birthday-kid')?.addEventListener('input', renderGuests);
+
+        async function createParty() {
             birthdayKid = document.getElementById('birthday-kid').value.trim();
+            const btn = document.getElementById('create-btn');
+            btn.textContent = '⏳ Создаём...';
+            btn.disabled = true;
+
+            try {
+                const response = await fetch('/api/party', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ birthday_kid: birthdayKid, guests: guests, tg_id: tgId })
+                });
+                const data = await response.json();
+                currentPartyId = data.party_id;
+                shareLink = data.share_link;
+                document.getElementById('share-link').textContent = shareLink;
+                showScreen('share');
+            } catch (e) {
+                alert('Ошибка: ' + e.message);
+                btn.textContent = 'Создать приглашения 🎉';
+                btn.disabled = false;
+            }
+        }
+
+        function copyLink() {
+            navigator.clipboard.writeText(shareLink);
+            const btn = document.querySelector('.btn-copy');
+            btn.textContent = '✅ Скопировано!';
+            setTimeout(() => btn.textContent = '📋 Скопировать ссылку', 2000);
+        }
+
+        function testInvite() {
             document.getElementById('select-title').textContent = 
                 `${birthdayKid} приглашает тебя на День Рождения!`;
-            
-            const btns = document.getElementById('guest-buttons');
-            btns.innerHTML = guests.map(g => 
-                `<button class="btn btn-secondary guest-btn" onclick="selectGuest('${g}')">${g}</button>`
-            ).join('');
-            
+            renderGuestButtons();
             showScreen('select');
         }
-        
+
         async function selectGuest(name) {
-            selectedGuest = name;
             const btns = document.querySelectorAll('.guest-btn');
             btns.forEach(b => {
                 if (b.textContent === name) {
@@ -315,14 +475,24 @@ HTML_CONTENT = '''
                     b.classList.add('loading');
                 }
             });
-            
+
             try {
+                // Claim guest
+                if (currentPartyId && tgId) {
+                    await fetch('/api/claim', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ party_id: currentPartyId, guest_name: name, tg_id: tgId })
+                    });
+                }
+
+                // Generate audio
                 const response = await fetch('/api/generate-audio', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ guest_name: name, birthday_kid: birthdayKid })
                 });
-                
+
                 if (response.ok) {
                     const blob = await response.blob();
                     const url = URL.createObjectURL(blob);
@@ -335,7 +505,7 @@ HTML_CONTENT = '''
             } catch (error) {
                 alert('Ошибка: ' + error.message);
             }
-            
+
             btns.forEach(b => {
                 if (b.textContent.includes('⏳')) {
                     b.textContent = name;
@@ -343,24 +513,18 @@ HTML_CONTENT = '''
                 }
             });
         }
-        
+
         function playAudio() {
             document.getElementById('audio-player').play();
         }
-        
+
         function showTask() {
             document.getElementById('task-btn').classList.add('hidden');
             document.getElementById('task-card').classList.remove('hidden');
         }
-        
-        function backToSelect() {
-            document.getElementById('task-btn').classList.remove('hidden');
-            document.getElementById('task-card').classList.add('hidden');
-            showScreen('select');
-        }
-        
+
         function showScreen(name) {
-            ['setup', 'select', 'invite'].forEach(s => {
+            ['setup', 'share', 'select', 'invite'].forEach(s => {
                 document.getElementById(`screen-${s}`).classList.add('hidden');
             });
             document.getElementById(`screen-${name}`).classList.remove('hidden');
